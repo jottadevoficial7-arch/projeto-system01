@@ -11,6 +11,7 @@ O objetivo desta entrega é uma aplicação utilizável, com ciclo completo de c
 - Disciplina proporcional, avaliações de dias vencidos e descanso do dia atual.
 - Painel de evolução, calendário mensal com registros, visão semanal, atributos e marcos de conquista.
 - Preferências de perfil, redução de movimento, exportação JSON e testes automatizados.
+- PostgreSQL com pooling, migrações versionadas, importação segura de SQLite e testes de concorrência.
 
 ## Próxima etapa de produto
 
@@ -23,7 +24,7 @@ O objetivo desta entrega é uma aplicação utilizável, com ciclo completo de c
 
 ## Antes de um lançamento comercial público
 
-1. Migrar a persistência para PostgreSQL com migrações, pooling e testes de concorrência entre instâncias. Avaliar Prisma conforme o plano de hospedagem.
+1. Configurar e verificar o PostgreSQL de produção na Vercel, ajustar capacidade/pooling conforme a carga real e ativar backups no provedor.
 2. Implementar confirmação de e-mail, recuperação de senha, política de sessão e gerenciamento de dispositivos.
 3. Adicionar limites de borda por origem/IP, controle de criação de demonstrações, limpeza de contas temporárias e mecanismos de proteção contra abuso.
 4. Automatizar backups com testes de restauração, monitoramento, alertas, rastreamento de erros e procedimentos de incidente.

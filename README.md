@@ -2,7 +2,7 @@
 
 Uma aplicação de evolução pessoal em português brasileiro: transforme atividades reais em missões, acumule experiência e acompanhe uma rotina sustentável. A identidade visual usa um painel escuro, emblemas originais, detalhes ciano e progressão de RPG.
 
-Esta versão é um **MVP executável com persistência no servidor**, adequado ao desenvolvimento e a uma instalação privada de instância única. O [roadmap](docs/roadmap.md) registra o trabalho necessário antes de um lançamento comercial amplo.
+Esta versão é um **MVP executável com persistência no servidor**, com PostgreSQL para desenvolvimento e funções serverless da Vercel. O [roadmap](docs/roadmap.md) registra o trabalho necessário antes de um lançamento comercial amplo.
 
 ## Prévias da aplicação
 
@@ -25,78 +25,74 @@ Capturas reais do modo demonstração.
 
 Os atributos representam uso e consistência dentro do aplicativo. Eles não são medições científicas de força, inteligência ou saúde. As atividades devem ser adaptadas à realidade da pessoa.
 
-## Requisitos e execução
+## Executar localmente
 
-- **Node.js 24.x** e npm. A versão está indicada em `.nvmrc`.
-- Um diretório gravável para o banco SQLite. Não é necessário configurar um serviço de banco externo.
+Requisitos: **Node.js 24.x**, npm e PostgreSQL 17 (Docker Compose é uma opção).
 
-Na raiz do projeto:
+1. Execute `npm ci` e copie `.env.example` para `.env.local`.
+2. Escolha uma senha local em `POSTGRES_PASSWORD`. Configure `DATABASE_URL` com `postgresql://the_system:SENHA_CODIFICADA_PARA_URL@127.0.0.1:5432/the_system`, usando a mesma senha. O texto `SENHA_CODIFICADA_PARA_URL` é um marcador, não uma credencial válida.
+3. Inicie e valide o banco:
 
 ```bash
-npm ci
-npm run dev
+docker compose --env-file .env.local up -d --wait postgres
+npm run db:migrate
+npm run db:check
 ```
 
-O servidor escuta na porta 3000. Abra essa porta no navegador da sua máquina ou use o acesso disponibilizado pelo seu ambiente. A primeira visita cria uma demonstração independente. Use **Criar meu sistema** para iniciar uma conta pessoal.
+4. Se existir `data/system.sqlite` da versão anterior, faça a [migração segura](docs/vercel-postgresql.md#4-preservar-e-migrar-dados-existentes) antes de abrir o aplicativo. O arquivo antigo não é apagado nem importado automaticamente.
+5. Execute `npm run dev` e abra a porta 3000 no navegador da sua máquina. A primeira visita cria uma demonstração independente; **Criar meu sistema** inicia uma conta pessoal.
 
-Se o diretório de cache padrão do npm não for gravável, defina `npm_config_cache` para um diretório permitido antes de executar `npm ci`.
+O volume nomeado do Compose mantém os dados após reiniciar os containers. Use `docker compose --env-file .env.local stop` para parar. Não remova o volume que contém seus dados. Se já possui PostgreSQL, basta configurar `DATABASE_URL`; Docker não é obrigatório.
 
-Para executar a compilação de produção:
+Para produção local:
 
 ```bash
 npm run build
 npm start
 ```
 
-`npm start` requer uma compilação concluída. Para outra porta, use `npm start -- --port 3100` ou `npm run dev -- --port 3100`.
+A build não precisa de banco configurado. As APIs precisam de uma conexão válida e do schema instalado. Outra porta: `npm start -- --port 3100`. Se necessário, configure `npm_config_cache` para um diretório gravável antes de instalar dependências.
 
-## Configuração
+## Publicar na Vercel
 
-O aplicativo funciona com os valores padrão. Para personalizar, copie `.env.example` para `.env.local` e ajuste:
+Siga o [passo a passo completo de PostgreSQL, migração e Vercel](docs/vercel-postgresql.md).
 
-| Variável | Uso | Padrão |
-|---|---|---|
-| `SYSTEM_DB_PATH` | Caminho do arquivo SQLite, relativo à raiz ou absoluto | `data/system.sqlite` |
-| `COOKIE_SECURE` | `true` quando a aplicação é servida por HTTPS | `false` no exemplo local |
-| `APP_ORIGIN` | Origem pública completa quando existe proxy reverso, como `https://seu-dominio.example` | Origem da requisição |
+| Variável              | Uso                                                                      |
+| --------------------- | ------------------------------------------------------------------------ |
+| `DATABASE_URL`        | Conexão PostgreSQL real; usar URL com pooling na Vercel                  |
+| `POSTGRES_URL`        | Alternativa quando `DATABASE_URL` estiver ausente                        |
+| `DATABASE_DIRECT_URL` | Opcional, conexão administrativa usada apenas pelos comandos de migração |
+| `COOKIE_SECURE`       | `true` em HTTPS; `false` em HTTP local                                   |
+| `APP_ORIGIN`          | Origem pública HTTPS real da aplicação em produção                       |
+| `POSTGRES_PASSWORD`   | Senha exclusivamente do PostgreSQL local via Compose                     |
+| `TEST_DATABASE_URL`   | Banco local separado, com nome terminado em `_test`, para testes         |
 
-Não use `COOKIE_SECURE=true` ao testar por HTTP local: o navegador não enviará esse cookie por uma conexão insegura. Em produção, configure HTTPS e a origem pública correta. Senhas e tokens não devem ser colocados nesses arquivos nem versionados.
+Nunca versionar credenciais nem usar `NEXT_PUBLIC_` para URLs de banco. `.env.local`, bancos SQLite antigos e backups ficam fora do Git. O antigo `SYSTEM_DB_PATH` não é usado. A aplicação não mantém dados de usuário em `/tmp` ou no disco das funções.
 
-O banco é criado automaticamente. `data/`, `.env.local`, dependências e resultados de build estão no `.gitignore`. As datas da rotina usam **America/Sao_Paulo**. O horário de uma missão organiza a rotina; o fechamento ocorre após a virada do dia, não no horário planejado.
+Todas as datas da rotina usam **America/Sao_Paulo**. O horário da missão organiza a rotina; o fechamento ocorre após a virada do dia, não no horário planejado.
 
-## Verificação
+## Verificar
+
+Crie um banco local exclusivo para testes, por exemplo:
+
+```bash
+docker compose --env-file .env.local exec postgres createdb -U the_system the_system_test
+```
+
+Configure `TEST_DATABASE_URL` para esse banco usando a credencial local. Cada teste cria e remove apenas seu próprio schema aleatório, sem truncar tabelas existentes. A suíte recusa URLs remotas e nomes de banco sem o sufixo `_test`.
 
 ```bash
 npm run typecheck
+# TEST_DATABASE_URL deve estar exportada neste terminal:
 npm test
 npm run build
 ```
 
-Os testes unitários cobrem a progressão. Os testes de integração usam SQLite temporário e cobrem autenticação, autorização, persistência, regras de conclusão, descanso e avaliações diárias. Eles não precisam de um servidor HTTP ativo.
+Se preferir guardar `TEST_DATABASE_URL` em `.env.local`, execute `node --env-file=.env.local --import tsx --test tests/*.test.ts`. Os testes cobrem domínio, autenticação, isolamento, persistência, concorrência, falhas de conexão e migração SQLite com backup e rollback. Só as fixtures descartáveis de migração usam SQLite temporário.
 
-Os testes de navegador precisam da aplicação em execução e de Chromium:
+Para os oito testes de navegador, inicie a aplicação em um terminal com `DATABASE_URL` apontando para um banco de testes já inicializado, então execute `npm run test:e2e` em outro. Nunca use o banco de produção para E2E. Para outra porta, configure `E2E_BASE_URL`. O Chromium do sistema em `/usr/bin/chromium` é detectado; alternativamente use `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` ou `npx playwright install chromium`.
 
-```bash
-# Terminal 1
-npm run dev
-```
-
-```bash
-# Terminal 2
-npm run test:e2e
-```
-
-A configuração usa `/usr/bin/chromium` quando disponível. Para outro binário, defina `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`. Sem navegador do sistema, instale o Chromium do Playwright com `npx playwright install chromium`. Para um servidor em outra porta, defina `E2E_BASE_URL` antes do comando de teste. A suíte cria perfis de teste independentes e executa os mesmos fluxos em desktop e mobile; use um banco descartável para não misturar essas contas com uma instalação pessoal.
-
-Os testes não iniciam nem encerram o servidor automaticamente. O relatório HTML fica em `playwright-report/`; falhas preservam capturas e traces em `test-results/`.
-
-## Persistência e instalação
-
-SQLite mantém os dados após recarregar o navegador ou reiniciar o processo, desde que o arquivo de banco seja preservado. Use **uma instância da aplicação com disco persistente**; hospedar em funções sem disco persistente pode perder dados e não é compatível com esta configuração.
-
-Para backup simples e consistente, encerre a aplicação, preserve todo o diretório `data/` e reinicie. Uma política de backup automatizada para serviço público deve usar mecanismos próprios de snapshot/backup do SQLite e testar restaurações. A exportação individual em JSON contém o histórico e as preferências; a interface de importação ainda não faz parte desta versão.
-
-A publicação no GitHub ou em um provedor de hospedagem não é feita pelos comandos de build. Para escalar para múltiplas instâncias, o próximo passo é migrar a persistência para PostgreSQL e revisar limites, observabilidade e operações.
+O [registro de validação](docs/VALIDACAO.md) distingue o que foi executado localmente do que ainda precisa de verificação na Vercel.
 
 ## Organização
 
@@ -105,9 +101,10 @@ src/app/                Páginas, estilos, layout e rotas HTTP
 src/components/         Interface e fluxos da aplicação
 src/lib/progression.ts  Regras matemáticas puras e versionadas
 src/lib/service.ts      Casos de uso e validações do servidor
-src/lib/db.ts           Schema, conexão e transações SQLite
+src/lib/db.ts           Pool e transações PostgreSQL
 src/lib/auth.ts         Senhas, sessões, limites e proteção de requisições
-tests/                  Testes de domínio e integração
+scripts/                Migração de schema, importação segura e diagnóstico
+tests/                  Testes de domínio, integração e migração
 tests/e2e/              Fluxos no navegador
 docs/                   Arquitetura, progressão e próximos passos
 ```
