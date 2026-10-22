@@ -11,7 +11,6 @@ import {
   sessionCookie,
 } from "@/lib/auth";
 import { login, register } from "@/lib/service";
-
 export const runtime = "nodejs";
 const authSchema = z.discriminatedUnion("action", [
   z
@@ -31,7 +30,6 @@ const authSchema = z.discriminatedUnion("action", [
     .strict(),
   z.object({ action: z.literal("logout") }).strict(),
 ]);
-
 export async function POST(request: Request) {
   try {
     assertSameOrigin(request);
@@ -40,26 +38,30 @@ export async function POST(request: Request) {
       throw new ApiError(400, "Preencha os campos da sua conta.");
     const data = parsed.data;
     if (data.action === "logout") {
-      revokeSession(request);
+      await revokeSession(request);
       return json({ ok: true }, 200, {
         "Set-Cookie": sessionCookie(request, null),
       });
     }
-    rateLimit(`auth:${data.email.trim().toLowerCase()}`, 10, 15 * 60 * 1000);
+    await rateLimit(
+      `auth:${data.email.trim().toLowerCase()}`,
+      10,
+      15 * 60 * 1000,
+    );
     const id =
       data.action === "register"
-        ? register({
+        ? await register({
             name: data.name,
             email: data.email,
             password: data.password,
           })
-        : login({ email: data.email, password: data.password });
-    revokeSession(request);
-    const token = createSession(id);
+        : await login({ email: data.email, password: data.password });
+    await revokeSession(request);
+    const token = await createSession(id);
     return json({ ok: true }, 200, {
       "Set-Cookie": sessionCookie(request, token),
     });
   } catch (error) {
-    return handleError(error);
+    return handleError(error, request);
   }
 }

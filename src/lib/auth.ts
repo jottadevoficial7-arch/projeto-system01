@@ -1,14 +1,13 @@
 import {
   createHash,
+  randomUUID,
   randomBytes,
   scryptSync,
   timingSafeEqual,
 } from "node:crypto";
-import { getDb, type UserRow } from "./db";
-
+import { getDb, StorageError, type UserRow } from "./db";
 export const SESSION_COOKIE = "system_session";
 const SESSION_SECONDS = 60 * 60 * 24 * 30;
-
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -17,14 +16,12 @@ export class ApiError extends Error {
     super(message);
   }
 }
-
 export function hashPassword(
   password: string,
   salt = randomBytes(24).toString("hex"),
 ) {
   return { salt, hash: scryptSync(password, salt, 64).toString("hex") };
 }
-
 export function verifyPassword(
   password: string,
   salt: string,
@@ -34,11 +31,9 @@ export function verifyPassword(
   const stored = Buffer.from(expected, "hex");
   return stored.length === actual.length && timingSafeEqual(stored, actual);
 }
-
 function tokenHash(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
-
 function requestToken(request: Request): string | null {
   const cookie = request.headers.get("cookie") || "";
   const value = cookie
@@ -48,22 +43,20 @@ function requestToken(request: Request): string | null {
   const token = value?.slice(SESSION_COOKIE.length + 1);
   return token && /^[a-f0-9]{64}$/.test(token) ? token : null;
 }
-
-export function findSession(request: Request): UserRow | null {
+export async function findSession(request: Request): Promise<UserRow | null> {
   const token = requestToken(request);
   if (!token) return null;
   return (
-    (getDb()
+    ((await getDb()
       .prepare(
         `SELECT users.* FROM users JOIN sessions ON users.id = sessions.user_id
     WHERE sessions.token_hash = ? AND sessions.expires_at > ?`,
       )
-      .get(tokenHash(token), Date.now()) as UserRow | undefined) ?? null
+      .get(tokenHash(token), Date.now())) as UserRow | undefined) ?? null
   );
 }
-
-export function requireUser(request: Request): UserRow {
-  const user = findSession(request);
+export async function requireUser(request: Request): Promise<UserRow> {
+  const user = await findSession(request);
   if (!user)
     throw new ApiError(
       401,
@@ -71,25 +64,26 @@ export function requireUser(request: Request): UserRow {
     );
   return user;
 }
-
-export function createSession(userId: string): string {
+export async function createSession(userId: string): Promise<string> {
   const db = getDb();
   const token = randomBytes(32).toString("hex");
-  db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(Date.now());
-  db.prepare(
-    "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
-  ).run(tokenHash(token), userId, Date.now() + SESSION_SECONDS * 1000);
+  await db
+    .prepare("DELETE FROM sessions WHERE expires_at <= ?")
+    .run(Date.now());
+  await db
+    .prepare(
+      "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+    )
+    .run(tokenHash(token), userId, Date.now() + SESSION_SECONDS * 1000);
   return token;
 }
-
-export function revokeSession(request: Request) {
+export async function revokeSession(request: Request) {
   const token = requestToken(request);
   if (token)
-    getDb()
+    await getDb()
       .prepare("DELETE FROM sessions WHERE token_hash = ?")
       .run(tokenHash(token));
 }
-
 export function sessionCookie(request: Request, token: string | null): string {
   const secure =
     new URL(request.url).protocol === "https:" ||
@@ -97,7 +91,6 @@ export function sessionCookie(request: Request, token: string | null): string {
     process.env.COOKIE_SECURE === "true";
   return `${SESSION_COOKIE}=${token || ""}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${token ? SESSION_SECONDS : 0}${secure ? "; Secure" : ""}`;
 }
-
 /** Browser mutations must originate from this application, including authenticated demos. */
 export function assertSameOrigin(request: Request) {
   const origin = request.headers.get("origin");
@@ -116,31 +109,30 @@ export function assertSameOrigin(request: Request) {
     throw new ApiError(403, "Origem da solicitação não permitida.");
   }
 }
-
-export function rateLimit(key: string, limit: number, windowMs: number) {
+export async function rateLimit(key: string, limit: number, windowMs: number) {
   const db = getDb();
   const now = Date.now();
   const id = createHash("sha256").update(key).digest("hex");
-  db.prepare("DELETE FROM rate_limits WHERE expires_at <= ?").run(now);
-  const row = db
-    .prepare("SELECT count FROM rate_limits WHERE key = ?")
-    .get(id) as { count: number } | undefined;
-  if (row && row.count >= limit)
+  const row = (await db
+    .prepare(
+      `INSERT INTO rate_limits (key, count, expires_at) VALUES (?, 1, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        count = CASE WHEN rate_limits.expires_at <= ? THEN 1 ELSE LEAST(rate_limits.count + 1, ?) END,
+        expires_at = CASE WHEN rate_limits.expires_at <= ? THEN EXCLUDED.expires_at ELSE rate_limits.expires_at END
+      RETURNING count`,
+    )
+    .get(id, now + windowMs, now, limit + 1, now)) as { count: number };
+  if (row.count > limit)
     throw new ApiError(
       429,
       "Muitas tentativas. Aguarde alguns minutos e tente novamente.",
     );
-  db.prepare(
-    `INSERT INTO rate_limits (key, count, expires_at) VALUES (?, 1, ?)
-    ON CONFLICT(key) DO UPDATE SET count = count + 1`,
-  ).run(id, now + windowMs);
 }
-
 export async function readBody(request: Request): Promise<unknown> {
   if (!request.headers.get("content-type")?.includes("application/json")) {
     throw new ApiError(415, "Envie os dados no formato JSON.");
   }
-  if (Number(request.headers.get("content-length")) > 20_000)
+  if (Number(request.headers.get("content-length")) > 20000)
     throw new ApiError(413, "Solicitação muito grande.");
   if (!request.body)
     throw new ApiError(400, "Os dados enviados não são válidos.");
@@ -151,7 +143,7 @@ export async function readBody(request: Request): Promise<unknown> {
     const { done, value } = await reader.read();
     if (done) break;
     bytes += value.byteLength;
-    if (bytes > 20_000) {
+    if (bytes > 20000) {
       await reader.cancel();
       throw new ApiError(413, "Solicitação muito grande.");
     }
@@ -164,7 +156,6 @@ export async function readBody(request: Request): Promise<unknown> {
     throw new ApiError(400, "Os dados enviados não são válidos.");
   }
 }
-
 export function json(
   data: unknown,
   status = 200,
@@ -175,16 +166,31 @@ export function json(
     headers: { "Cache-Control": "no-store", ...headers },
   });
 }
-
-export function handleError(error: unknown): Response {
+export function handleError(error: unknown, request?: Request): Response {
   if (error instanceof ApiError)
     return json({ error: error.message }, error.status);
-  console.error(
-    "[THE SYSTEM] Falha interna:",
-    error instanceof Error ? error.message : "unknown",
-  );
+  const requestId = randomUUID();
+  const storage = error instanceof StorageError;
+  console.error("[THE SYSTEM] request_failed", {
+    requestId,
+    method: request?.method,
+    path: request
+      ? new URL(request.url).pathname.replace(
+          /\/[0-9a-f-]{36}(?=\/|$)/gi,
+          "/:id",
+        )
+      : undefined,
+    code: storage ? error.code : "INTERNAL_ERROR",
+    operation: storage ? error.operation : "request",
+  });
   return json(
-    { error: "O sistema encontrou um problema. Tente novamente em instantes." },
-    500,
+    {
+      error: storage
+        ? "Armazenamento indisponível. Tente novamente em instantes."
+        : "O sistema encontrou um problema. Tente novamente em instantes.",
+      requestId,
+    },
+    storage ? 503 : 500,
+    { "X-Request-ID": requestId },
   );
 }

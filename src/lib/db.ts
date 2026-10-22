@@ -1,7 +1,222 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  Pool,
+  type PoolClient,
+  type PoolConfig,
+  type QueryResultRow,
+} from "pg";
+import { SCHEMA_SQL, SCHEMA_VERSION } from "./database-schema";
 
+export class StorageError extends Error {
+  constructor(
+    public code: string,
+    public operation: string,
+  ) {
+    super(`PostgreSQL: ${code}`);
+  }
+}
+
+export function storageError(error: unknown, operation: string): StorageError {
+  if (error instanceof StorageError) return error;
+  const code = (error as { code?: unknown })?.code;
+  return new StorageError(
+    typeof code === "string" && /^[A-Z0-9_]+$/.test(code)
+      ? code
+      : "DATABASE_FAILURE",
+    operation,
+  );
+}
+
+/** Remote connections always verify TLS. Never accept sslmode=no-verify. */
+export function connectionConfig(
+  url = process.env.DATABASE_URL || process.env.POSTGRES_URL,
+): PoolConfig {
+  if (!url) throw new StorageError("DATABASE_URL_MISSING", "configure");
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new StorageError("DATABASE_URL_INVALID", "configure");
+  }
+  if (!["postgres:", "postgresql:"].includes(parsed.protocol))
+    throw new StorageError("DATABASE_URL_INVALID", "configure");
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
+  const mode = parsed.searchParams.get("sslmode");
+  if (
+    mode === "no-verify" ||
+    (!local &&
+      (mode === "disable" || parsed.searchParams.get("ssl") === "false"))
+  ) {
+    throw new StorageError("DATABASE_TLS_REQUIRED", "configure");
+  }
+  // pg URL SSL parameters can replace the ssl object; remove them to enforce verification.
+  for (const key of ["ssl", "sslmode", "sslcert", "sslkey", "sslrootcert"])
+    parsed.searchParams.delete(key);
+  return {
+    connectionString: parsed.toString(),
+    ssl:
+      local && (!mode || mode === "disable")
+        ? false
+        : { rejectUnauthorized: true },
+    max: 5,
+    connectionTimeoutMillis: 10_000,
+    idleTimeoutMillis: 10_000,
+    statement_timeout: 15_000,
+    application_name: "the-system",
+    allowExitOnIdle: true,
+  };
+}
+
+const globalDb = globalThis as unknown as { systemPgPool?: Pool };
+const context = new AsyncLocalStorage<PoolClient>();
+export function getPool(): Pool {
+  if (!globalDb.systemPgPool) {
+    const pool = new Pool(connectionConfig());
+    pool.on("error", (error) => {
+      const safe = storageError(error, "pool");
+      console.error("[THE SYSTEM] storage", {
+        code: safe.code,
+        operation: safe.operation,
+      });
+    });
+    globalDb.systemPgPool = pool;
+  }
+  return globalDb.systemPgPool;
+}
+
+/** Only internal SQL is accepted here. Values always travel as bound parameters. */
+function placeholders(sql: string): string {
+  let index = 0;
+  let quote = "";
+  let result = "";
+  for (let i = 0; i < sql.length; i++) {
+    const char = sql[i];
+    if (quote) {
+      result += char;
+      if (char === quote) {
+        if (sql[i + 1] === quote) result += sql[++i];
+        else quote = "";
+      }
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      result += char;
+    } else result += char === "?" ? `$${++index}` : char;
+  }
+  return result;
+}
+
+export async function query<T extends QueryResultRow = Record<string, unknown>>(
+  sql: string,
+  values: unknown[] = [],
+) {
+  try {
+    return await (context.getStore() || getPool()).query<T>(sql, values);
+  } catch (error) {
+    throw storageError(error, "query");
+  }
+}
+const database = {
+  prepare(sql: string) {
+    const text = placeholders(sql);
+    return {
+      async get(...values: unknown[]) {
+        return (await query(text, values)).rows[0];
+      },
+      async all(...values: unknown[]) {
+        return (await query(text, values)).rows;
+      },
+      async run(...values: unknown[]) {
+        return { changes: (await query(text, values)).rowCount };
+      },
+    };
+  },
+  async exec(sql: string) {
+    await query(sql);
+  },
+};
+export function getDb() {
+  return database;
+}
+export async function closeDb() {
+  const pool = globalDb.systemPgPool;
+  delete globalDb.systemPgPool;
+  await pool?.end();
+}
+
+export async function transaction<T>(
+  operation: (db: typeof database) => Promise<T>,
+): Promise<T> {
+  if (context.getStore()) return operation(database);
+  let client: PoolClient;
+  try {
+    client = await getPool().connect();
+  } catch (error) {
+    throw storageError(error, "connect");
+  }
+  let broken = false;
+  try {
+    await client.query("BEGIN");
+    const result = await context.run(client, () => operation(database));
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      broken = true;
+    }
+    throw error;
+  } finally {
+    client.release(broken);
+  }
+}
+
+/** Serialize every read/modify/write for an account across serverless instances. */
+export async function withUserTransaction<T>(
+  userId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return transaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `user:${userId}`,
+    ]);
+    return operation();
+  });
+}
+
+/** Explicit administrative command; never called by API requests or the build. */
+export async function migrateDatabase() {
+  return transaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(90813001)");
+    await query(
+      "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    );
+    const versions = (
+      await query<{ version: number }>(
+        "SELECT version FROM schema_migrations ORDER BY version",
+      )
+    ).rows;
+    if (versions.some((row) => row.version > SCHEMA_VERSION))
+      throw new StorageError("DATABASE_SCHEMA_NEWER", "migrate");
+    if (!versions.some((row) => row.version === 1)) {
+      await query(SCHEMA_SQL);
+      await query("INSERT INTO schema_migrations (version) VALUES (1)");
+    }
+  });
+}
+
+export async function checkDatabase() {
+  const result = await query<{ version: number }>(
+    "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1",
+  );
+  if (result.rows[0]?.version !== SCHEMA_VERSION)
+    throw new StorageError("DATABASE_MIGRATION_REQUIRED", "health");
+  // Also checks runtime privileges and all data tables without exposing user data.
+  await query(
+    "SELECT 1 FROM users, sessions, missions, completions, rest_days, day_assessments, rate_limits LIMIT 0",
+  );
+  return { status: "ok", storage: "postgresql", schemaVersion: SCHEMA_VERSION };
+}
 export type UserRow = {
   id: string;
   name: string;
@@ -16,88 +231,3 @@ export type UserRow = {
   discipline: number;
   last_assessed: string;
 };
-
-const globalDb = globalThis as unknown as {
-  systemDb?: DatabaseSync;
-  systemDbPath?: string;
-};
-
-export function getDb(): DatabaseSync {
-  const path =
-    process.env.SYSTEM_DB_PATH || resolve(process.cwd(), "data/system.sqlite");
-  if (globalDb.systemDb && globalDb.systemDbPath === path)
-    return globalDb.systemDb;
-  if (globalDb.systemDb) globalDb.systemDb.close();
-  if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-  const db = new DatabaseSync(path);
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA foreign_keys = ON;
-    PRAGMA busy_timeout = 5000;
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE,
-      password_hash TEXT, password_salt TEXT, is_demo INTEGER NOT NULL DEFAULT 0,
-      avatar TEXT NOT NULL DEFAULT 'spark', goal TEXT NOT NULL DEFAULT '',
-      daily_minutes INTEGER NOT NULL DEFAULT 30, created_at TEXT NOT NULL,
-      discipline INTEGER NOT NULL DEFAULT 100 CHECK(discipline BETWEEN 0 AND 100),
-      last_assessed TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS sessions (
-      token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      expires_at INTEGER NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS missions (
-      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', category TEXT NOT NULL,
-      difficulty TEXT NOT NULL, duration INTEGER NOT NULL, frequency TEXT NOT NULL,
-      time TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL, deleted_at TEXT
-    );
-    CREATE INDEX IF NOT EXISTS missions_user ON missions(user_id, active);
-    CREATE TABLE IF NOT EXISTS completions (
-      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      mission_id TEXT NOT NULL REFERENCES missions(id), period_key TEXT NOT NULL,
-      title TEXT NOT NULL, normalized_title TEXT NOT NULL, category TEXT NOT NULL,
-      difficulty TEXT NOT NULL, xp INTEGER NOT NULL CHECK(xp BETWEEN 0 AND 150),
-      date TEXT NOT NULL, created_at TEXT NOT NULL,
-      UNIQUE(mission_id, period_key), UNIQUE(mission_id, date),
-      UNIQUE(user_id, normalized_title, date)
-    );
-    CREATE INDEX IF NOT EXISTS completions_user_date ON completions(user_id, date);
-    CREATE TABLE IF NOT EXISTS rest_days (
-      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, date TEXT NOT NULL,
-      created_at TEXT NOT NULL, PRIMARY KEY(user_id, date)
-    );
-    CREATE TABLE IF NOT EXISTS day_assessments (
-      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, date TEXT NOT NULL,
-      completed INTEGER NOT NULL, scheduled INTEGER NOT NULL, rest INTEGER NOT NULL,
-      discipline_delta INTEGER NOT NULL, rules_version INTEGER NOT NULL,
-      PRIMARY KEY(user_id, date)
-    );
-    CREATE TABLE IF NOT EXISTS rate_limits (
-      key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires_at INTEGER NOT NULL
-    );
-  `);
-  globalDb.systemDb = db;
-  globalDb.systemDbPath = path;
-  return db;
-}
-
-export function closeDb(): void {
-  globalDb.systemDb?.close();
-  delete globalDb.systemDb;
-  delete globalDb.systemDbPath;
-}
-
-export function transaction<T>(operation: (db: DatabaseSync) => T): T {
-  const db = getDb();
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const result = operation(db);
-    db.exec("COMMIT");
-    return result;
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-}

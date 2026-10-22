@@ -4,7 +4,7 @@
 
 Next.js 16 organiza a aplicação em uma página interativa e rotas HTTP do App Router. React 19 e TypeScript compõem a interface, com CSS próprio para a identidade visual. Fontes Inter e Rajdhani são instaladas como dependências e servidas pelo aplicativo; os ícones são Lucide. Não há dependência de APIs de imagens, IA ou fontes remotas em tempo de uso.
 
-O servidor usa o módulo `node:sqlite` do Node.js 24. SQLite oferece persistência real e transações sem exigir credenciais ou um serviço adicional neste ambiente. A escolha atende uma instalação de instância única; PostgreSQL e uma camada de migrações são a evolução prevista para múltiplas instâncias. Esta versão não utiliza Prisma.
+O servidor usa PostgreSQL pelo driver `pg`, tanto localmente quanto na Vercel. O pool é criado sob demanda, com até cinco conexões por instância, timeouts e verificação de TLS em bancos remotos. A build não exige conexão. O schema versionado é aplicado explicitamente por `npm run db:migrate`; não há DDL durante requisições. Esta versão não utiliza Prisma.
 
 ## Camadas
 
@@ -16,17 +16,18 @@ O servidor usa o módulo `node:sqlite` do Node.js 24. SQLite oferece persistênc
 
 ## Persistência
 
-| Tabela | Responsabilidade |
-|---|---|
-| `users` | Identidade, credenciais derivadas, preferências e estado de disciplina |
-| `sessions` | Hash do token de sessão e prazo de validade |
-| `missions` | Planejamento atual e arquivamento, com proprietário |
-| `completions` | Livro de registros com título, categoria, recompensa e data da execução |
-| `rest_days` | Descansos registrados por usuário/data |
-| `day_assessments` | Avaliação única de cada dia vencido, com versão da regra |
-| `rate_limits` | Contadores temporários para tentativas de autenticação |
+| Tabela              | Responsabilidade                                                                 |
+| ------------------- | -------------------------------------------------------------------------------- |
+| `users`             | Identidade, credenciais derivadas, preferências e estado de disciplina           |
+| `sessions`          | Hash do token de sessão e prazo de validade                                      |
+| `missions`          | Planejamento atual e arquivamento, com proprietário                              |
+| `completions`       | Livro de registros com título, categoria, recompensa e data da execução          |
+| `rest_days`         | Descansos registrados por usuário/data                                           |
+| `day_assessments`   | Avaliação única de cada dia vencido, com versão da regra                         |
+| `rate_limits`       | Contadores temporários para tentativas de autenticação, atualizados atomicamente |
+| `schema_migrations` | Versões de schema aplicadas                                                      |
 
-O banco usa WAL, chaves estrangeiras e tempo de espera para escrita. A conclusão de uma missão calcula o saldo diário e grava a recompensa dentro da mesma transação. Índices únicos impedem duplicação por missão/período e por título normalizado no mesmo dia. A edição e o arquivamento preservam os registros de conclusão existentes.
+O banco usa chaves estrangeiras e restrições de unicidade. Cada operação de conta usa uma transação com advisory lock por usuário, compartilhado entre instâncias. `AsyncLocalStorage` mantém todas as consultas da operação na mesma conexão até commit ou rollback, inclusive após `await`. A conclusão de uma missão calcula o saldo diário e grava a recompensa dentro da mesma transação. Índices únicos impedem duplicação por missão/período e por título normalizado no mesmo dia. A edição e o arquivamento preservam os registros de conclusão existentes.
 
 Não se tenta verificar automaticamente se uma pessoa realmente realizou uma atividade: o registro é autodeclarado. As proteções impedem duplicidade e manipulação direta dos números pela interface, mas não substituem um mecanismo de comprovação de atividades.
 
@@ -40,19 +41,20 @@ As entradas são validadas com Zod, têm limites de tamanho e não podem determi
 
 ## Rotas
 
-| Método e rota | Efeito |
-|---|---|
-| `GET /api/system` | Estado do perfil; cria demonstração independente quando não existe sessão |
-| `POST /api/auth` | Ação `register`, `login` ou `logout` |
-| `POST /api/missions` | Cria uma missão do usuário autenticado |
-| `PATCH /api/missions/:id` | Edita uma missão autorizada |
-| `DELETE /api/missions/:id` | Arquiva uma missão, preservando histórico |
-| `POST /api/missions/:id/complete` | Registra uma conclusão e calcula a recompensa no servidor |
-| `POST /api/rest` | Ativa ou retira o descanso do dia atual |
-| `PATCH /api/profile` | Atualiza nome, emblema, objetivo e tempo disponível |
-| `GET /api/export` | Exporta os dados do perfil, sem hashes de senha ou tokens |
+| Método e rota                     | Efeito                                                                    |
+| --------------------------------- | ------------------------------------------------------------------------- |
+| `GET /api/health`                 | Verifica conexão, schema e acesso sem criar dados                         |
+| `GET /api/system`                 | Estado do perfil; cria demonstração independente quando não existe sessão |
+| `POST /api/auth`                  | Ação `register`, `login` ou `logout`                                      |
+| `POST /api/missions`              | Cria uma missão do usuário autenticado                                    |
+| `PATCH /api/missions/:id`         | Edita uma missão autorizada                                               |
+| `DELETE /api/missions/:id`        | Arquiva uma missão, preservando histórico                                 |
+| `POST /api/missions/:id/complete` | Registra uma conclusão e calcula a recompensa no servidor                 |
+| `POST /api/rest`                  | Ativa ou retira o descanso do dia atual                                   |
+| `PATCH /api/profile`              | Atualiza nome, emblema, objetivo e tempo disponível                       |
+| `GET /api/export`                 | Exporta os dados do perfil, sem hashes de senha ou tokens                 |
 
-Respostas do estado e das APIs usam `Cache-Control: no-store`. Erros esperados têm mensagem em português; detalhes internos não são enviados ao cliente.
+Respostas do estado e das APIs usam `Cache-Control: no-store`. Erros esperados têm mensagem em português; detalhes internos não são enviados ao cliente. Indisponibilidade de armazenamento retorna 503 com requestId correlacionado a logs de código/operação, sem credenciais, SQL, cookies ou dados pessoais.
 
 ## Calendário e fechamento
 
@@ -62,4 +64,8 @@ Dias vencidos são avaliados ao acessar o estado ou executar operações relevan
 
 ## Limites operacionais
 
-O processo Node precisa de um disco persistente, Node 24 e uma única instância que compartilhe o banco. Não há e-mails transacionais, recuperação de senha, verificação de e-mail, notificações push, pagamento, sincronização offline ou importação de dados nesta versão. Exportação e armazenamento local no servidor estão implementados. Não é necessário nenhum segredo de serviço externo para executar o MVP.
+O processo Node usa um serviço PostgreSQL persistente externo ao deploy. Todos os dados de contas, missões recorrentes, conclusões e avaliações ficam nesse serviço; XP, níveis, ranks, conquistas e estatísticas são derivados desses registros. A única preferência no `localStorage` é a redução de animações. Não há armazenamento de fotos ou uploads no backend atual; imagens da interface são recursos estáticos.
+
+O único acesso a arquivos de banco está em `scripts/sqlite-import.ts`, um comando administrativo fora das rotas. Ele lê a origem SQLite sem alterá-la, gera um backup consistente, valida o conteúdo e importa somente para destino vazio em uma transação. Consulte [a operação e a migração](vercel-postgresql.md).
+
+Não há e-mails transacionais, recuperação de senha, verificação de e-mail, notificações push, pagamento, sincronização offline ou importação de exportações pela interface nesta versão. As funcionalidades existentes foram preservadas; esses itens continuam no roadmap.
